@@ -1,0 +1,127 @@
+name: PLE dev eval (CI)
+
+# Runs the PLE kit against this harness on a GitHub-hosted runner (Docker
+# available there; the maintainer's VM cannot run containers).
+# The submission.yaml in this repo targets google-cloud/claude-opus-5-5 for
+# Stage 2. For CI dev runs the workflow rewrites model_api (and optionally
+# model_base_url) in the checkout only, pointing at a model we can call
+# from CI. Secrets needed:
+#   HF_TOKEN       - Hugging Face token with access to the gated dev set
+#   GEMINI_API_KEY - when model_api is gemini/<model>
+#   MODEL_API_KEY  - when model_api is openai-compatible/<model>
+# Results (runs/) are uploaded as workflow artifacts, even on timeout.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check (kit check only) or eval (dev-set run)"
+        required: true
+        default: "check"
+        type: choice
+        options: [check, eval]
+      tasks:
+        description: "comma-separated dev task ids (eval mode)"
+        required: false
+        default: "data-hall-mep-routing,data-center-site-model,frame-extension-method,wind-diaphragm-shear,roof-deck-design,cooling-water-flush-plan"
+      trials:
+        description: "tasks run at once"
+        required: false
+        default: "1"
+      model_api:
+        description: "CI model_api override, e.g. gemini/gemini-3.5-flash-lite or openai-compatible/gpt-6.1-sol"
+        required: true
+        default: "gemini/gemini-3.5-flash-lite"
+      model_base_url:
+        description: "only for openai-compatible: public https base URL, e.g. https://api.xingchiapi.com/v1"
+        required: false
+        default: ""
+
+jobs:
+  ple:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+    steps:
+      - name: Check out harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+
+      - name: Clone PLE upstream (kit + eval)
+        run: git clone --depth 1 https://github.com/google-research/ple.git ple
+
+      - name: Point submission.yaml at the CI model (checkout only)
+        working-directory: harness
+        env:
+          CI_MODEL_API: ${{ inputs.model_api }}
+          CI_MODEL_BASE_URL: ${{ inputs.model_base_url }}
+        run: |
+          python3 - <<'EOF'
+          import os, pathlib
+          p = pathlib.Path("submission.yaml")
+          out = []
+          for ln in p.read_text().splitlines():
+              if ln.startswith("model_api:"):
+                  out.append("model_api: " + os.environ["CI_MODEL_API"])
+              elif ln.startswith("model_base_url:"):
+                  continue
+              else:
+                  out.append(ln)
+          if os.environ.get("CI_MODEL_BASE_URL"):
+              out.append("model_base_url: " + os.environ["CI_MODEL_BASE_URL"])
+          p.write_text("\n".join(out) + "\n")
+          print(p.read_text())
+          EOF
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install Harbor
+        run: |
+          uv tool install harbor==0.20.0 --with websockets
+          harbor --version
+
+      - name: Docker sanity
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+
+      - name: Cache dev-set tasks
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/plebench/tasks
+          key: ple-tasks-b3857a3fea39a695e18f845d4a88f29442e96e75
+
+      - name: kit check
+        if: inputs.mode == 'check'
+        working-directory: ple
+        run: uv run python -m kit check ../harness
+
+      - name: Dev-set eval
+        if: inputs.mode == 'eval'
+        working-directory: ple
+        env:
+          CI_TASKS: ${{ inputs.tasks }}
+          CI_TRIALS: ${{ inputs.trials }}
+        run: |
+          uv run python eval/run.py ../harness \
+            --tasks "$CI_TASKS" \
+            --trials "$CI_TRIALS" \
+            --out "runs/ci-${{ github.run_id }}"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ple-runs-${{ github.run_id }}
+          path: |
+            ple/runs/
+            harness/artifacts/
+          if-no-files-found: ignore
+          retention-days: 30
