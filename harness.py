@@ -51,6 +51,21 @@ THINKING = "max"
 # stop pi this long before the deadline (less on short tasks) so its answer
 # arrives
 STOP_BEFORE_SEC = 90
+# Pi does not retry provider "quota exceeded" errors (it classifies them as
+# non-retryable limit errors), so a free-tier per-minute rate limit ends the
+# run. solve() restarts pi after such an interruption instead: at most
+# MAX_RESTARTS times, waiting RESTART_WAIT_SEC for the quota window to slide,
+# and only while at least MIN_TIME_FOR_RESTART_SEC remains.
+MAX_RESTARTS = 24
+RESTART_WAIT_SEC = 30
+MIN_TIME_FOR_RESTART_SEC = 360
+CONTINUATION_NOTE = (
+    "\n\n[Continuation: an earlier attempt at this task was interrupted by a"
+    " model rate limit. Files already created in the working directory"
+    " persist. First inspect the current state of the working directory"
+    " (including PROGRESS.md and any deliverable files already written),"
+    " then continue the task and finish all deliverables.]"
+)
 CATALOG_TIMEOUT_SEC = 30
 # Pi settings: retry failed requests up to 8 times with exponential backoff
 # from 2 s to 60 s (~4 minutes total, versus Pi's 14 s default), set a 1-hour
@@ -81,6 +96,15 @@ NOTE = (
     " deliverable exactly where and in the format the instruction asks, and"
     " check what you wrote. When you are done, reply with a short summary of"
     " what you delivered and where."
+    " Write a first working version of every deliverable file as early as you"
+    " can, then improve it; never leave a provided stub file untouched."
+    " Keep a short progress note (PROGRESS.md) in the working directory updated"
+    " as you go, so work can resume if you are interrupted."
+    " Input drawings are PNG images: view them with the read tool, which shows"
+    " them to you as images; never dump binary files as text."
+    " You are limited to about 15 model requests per minute, so prefer fewer,"
+    " larger steps: batch independent tool calls in one step, and do not"
+    " re-read files you have already seen."
 )
 TIME_NOTE = (
     " You have about {minutes} minutes in all; leave time to finish the"
@@ -184,7 +208,12 @@ def configure(
   # `pi --list-models` reads the provider here
   models.write_text(json.dumps({"providers": {name: config}}))
   if not in_catalog(name, model, env):
-    config["models"] = [{"id": model, "name": model, **UNKNOWN_MODEL}]
+    entry = {"id": model, "name": model, **UNKNOWN_MODEL}
+    if name == "google":
+      # Gemini models are multimodal; keep image input if the catalog
+      # probe missed a model that is actually known.
+      entry["input"] = ["text", "image"]
+    config["models"] = [entry]
     models.write_text(json.dumps({"providers": {name: config}}))
   (agent_dir / "settings.json").write_text(json.dumps(SETTINGS))
   servers = {
@@ -200,6 +229,10 @@ class Run:
 
   def __init__(self, session: taskbridge.Session, model: str):
     self.session, self.model, self.replies = session, model, 0
+    # Set when the model's last reply ended in an error (e.g. a provider
+    # rate limit pi classifies as non-retryable); solve() restarts pi then.
+    self.model_error: str | None = None
+    self.last_stop_reason: str | None = None
 
   async def on_event(self, event: dict[str, Any]) -> None:
     """Processes a parsed JSON event from Pi, updating final message and usage.
@@ -217,7 +250,9 @@ class Run:
       )
       if text.strip():
         self.session.final_message = text.strip()
+      self.last_stop_reason = message.get("stopReason")
       if message.get("stopReason") == "error":
+        self.model_error = str(message.get("errorMessage") or "model error")
         await self.session.log(
             f"pi: model error: {message.get('errorMessage')}"
         )
@@ -314,19 +349,37 @@ async def solve(session: taskbridge.Session) -> str:
           note(session),
       ]
       run = Run(session, model)
-      done = await taskbridge.run_process(
-          argv,
-          session,
-          env=env,
-          cwd=str(work),
-          on_line=run.on_line,
-          stdin=session.instruction.encode(),
-          stop_before_sec=STOP_BEFORE_SEC,
-          log_prefix="pi: ",
-      )
-  if not run.replies:
+      done = None
+      total_replies = 0
+      for attempt in range(MAX_RESTARTS + 1):
+        if attempt:
+          await session.log(
+              f"pi: restarting after model error (attempt {attempt + 1})"
+          )
+          await asyncio.sleep(RESTART_WAIT_SEC)
+        run = Run(session, model)
+        done = await taskbridge.run_process(
+            argv,
+            session,
+            env=env,
+            cwd=str(work),
+            on_line=run.on_line,
+            stdin=(
+                session.instruction
+                + (CONTINUATION_NOTE if attempt else "")
+            ).encode(),
+            stop_before_sec=STOP_BEFORE_SEC,
+            log_prefix="pi: ",
+        )
+        total_replies += run.replies
+        if run.replies and run.last_stop_reason != "error":
+          break
+        left = session.time_left()
+        if left is not None and left < MIN_TIME_FOR_RESTART_SEC:
+          break
+  if not total_replies:
     raise RuntimeError(
-        f"pi exited with {done.code} before the model answered:"
-        f" {done.stderr[-2000:]}"
+        f"pi exited with {done.code if done else '?'} before the model"
+        f" answered: {(done.stderr if done else '')[-2000:]}"
     )
   return session.final_message or "(pi stopped without a final message)"
