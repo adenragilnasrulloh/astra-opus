@@ -55,9 +55,10 @@ STOP_BEFORE_SEC = 90
 # non-retryable limit errors), so a free-tier per-minute rate limit ends the
 # run. solve() restarts pi after such an interruption instead: at most
 # MAX_RESTARTS times, waiting RESTART_WAIT_SEC for the quota window to slide,
-# and only while at least MIN_TIME_FOR_RESTART_SEC remains.
-MAX_RESTARTS = 24
-RESTART_WAIT_SEC = 30
+# and only while at least MIN_TIME_FOR_RESTART_SEC remains. (Task 2 of the
+# dev batch hit the original 24-restart cap, hence 60 with a longer wait.)
+MAX_RESTARTS = 60
+RESTART_WAIT_SEC = 45
 MIN_TIME_FOR_RESTART_SEC = 360
 CONTINUATION_NOTE = (
     "\n\n[Continuation: an earlier attempt at this task was interrupted by a"
